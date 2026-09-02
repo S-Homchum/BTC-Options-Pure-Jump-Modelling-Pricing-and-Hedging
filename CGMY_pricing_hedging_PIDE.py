@@ -73,22 +73,22 @@ class PIDE_Pricer:
         return H
 
     def integral_part(self,i): # R_{i,j}; j=0
-    # I: negative jump, piecewise-constant
+    # I: negative jump, within the grid bound
         I = sum(
         self.ln_**self.Y * (self.H[i-k] - self.H[i] - k*(self.H[i-k-1] - self.H[i-k])) *
         (self.g2(k*self.dx*self.ln_, self.Y) - self.g2((k+1)*self.dx*self.ln_, self.Y))
         for k in range(1, i))
-    # II: negative jump, linear correction
+    # II: negative jump, beyond the grid bound
         II = sum(
         (self.H[i-k-1] - self.H[i-k]) / (self.ln_**(1-self.Y) * self.dx) *
         (self.g1(k*self.dx*self.ln_, self.Y) - self.g1((k+1)*self.dx*self.ln_, self.Y))
         for k in range(1, i))
-    # III: positive jump, piecewise-constant
+    # III: positive jump, within the grid bound
         III = sum(
         self.lp**self.Y * (self.H[i+k] - self.H[i] - k*(self.H[i+k+1] - self.H[i+k])) *
         (self.g2(k*self.dx*self.lp, self.Y) - self.g2((k+1)*self.dx*self.lp, self.Y))
         for k in range(1, self.N - i))
-    # IV: positive jump, linear correction
+    # IV: positive jump, beyond the grid bound
         IV = sum(
         (self.H[i+k+1] - self.H[i+k]) / (self.lp**(1-self.Y) * self.dx) *
         (self.g1(k*self.dx*self.lp, self.Y) - self.g1((k+1)*self.dx*self.lp, self.Y))
