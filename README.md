@@ -81,7 +81,7 @@ Two conventions are handled explicitly, and both matter for calibration.
 in USD. The panel carries both `price_btc` and `price_usd`, and the pricer in the
 calibration module prices the inverse payoff directly rather than converting.
 
-**Futures as the underlying.** Options settle against the future, not the index,
+**Futures as the underlying.** Options settle against the future,
 so the panel carries the traded future itself. `get_dated_futures_for_expiries()`
 pulls the OHLCV of the dated future matching each option expiry, and
 `attach_dated_future()` merges it onto every row on `(timestamp, expiry_dt)` —
@@ -103,7 +103,7 @@ from src.Deribit_option_retrieval import get_deribit_pricing_data
 
 panel = get_deribit_pricing_data(
     start_date="2025-05-01",
-    end_date="2025-05-30",
+    end_date="2025-06-30",
     resolution="5",
     min_tte_days=1.0,
     fetch_dated_futures=True,
