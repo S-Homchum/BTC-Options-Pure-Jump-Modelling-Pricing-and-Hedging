@@ -69,8 +69,6 @@ Three streams from the public Deribit API, joined into one panel.
 - **Options**: tick-level trades for every listed BTC option — all strikes, all
   expiries, calls and puts, no filter — via
   `get_last_trades_by_currency_and_time`, then binned to the same resolution.
-- **Dated futures**: OHLCV for the termed future sharing each option's expiry,
-  fetched one instrument per distinct expiry in the panel.
 - **Optional live snapshot**: `get_live_chain()` pulls mark price and mark IV for
   every listed instrument from `get_book_summary_by_currency`, so a cross-section
   is available without waiting for trades.
