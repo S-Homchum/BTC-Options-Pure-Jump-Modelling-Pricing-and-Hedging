@@ -101,7 +101,7 @@ from src.Deribit_option_retrieval import get_deribit_pricing_data
 
 panel = get_deribit_pricing_data(
     start_date="2025-05-01",
-    end_date="2025-06-30",
+    end_date="2025-05-30",
     resolution="5",
     min_tte_days=1.0,
     compute_forwards=True,
