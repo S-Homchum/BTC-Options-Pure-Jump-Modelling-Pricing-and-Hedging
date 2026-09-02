@@ -157,29 +157,87 @@ _MONTH_ABBR = ["JAN", "FEB", "MAR", "APR", "MAY", "JUN",
 
 
 def future_instrument_name(expiry_dt, currency="BTC"):
+    # Deribit does NOT zero-pad the day: BTC-5APR19, not BTC-05APR19.
     expiry_dt = pd.Timestamp(expiry_dt)
-    return (f"{currency}-{expiry_dt.day:02d}"
+    return (f"{currency}-{expiry_dt.day}"
             f"{_MONTH_ABBR[expiry_dt.month - 1]}{expiry_dt.year % 100:02d}")
 
 
+def get_futures_instruments(currency="BTC", include_expired=True, sleep_sec=0.3):
+    """Real listed future names from Deribit, keyed by expiry date.
+
+    Beats building the name by hand: it gets the day-padding right, and it
+    only ever returns maturities Deribit actually listed. Active instruments
+    come from www; expired ones from history.deribit.com, which keeps the
+    full back catalogue."""
+    rows = []
+    jobs = [(DERIBIT_BASE, "false")]
+    if include_expired:
+        jobs.append((DERIBIT_HIST, "true"))
+
+    for base, expired in jobs:
+        url = f"{base}/public/get_instruments"
+        params = {"currency": currency, "kind": "future", "expired": expired}
+        try:
+            r = requests.get(url, params=params, timeout=30)
+            r.raise_for_status()
+            result = r.json().get("result", [])
+        except Exception as e:
+            print(f"  Error listing futures (expired={expired}): {e}")
+            result = []
+
+        for item in result:
+            name = item.get("instrument_name", "")
+            ts = item.get("expiration_timestamp")
+            if not name or ts is None:
+                continue
+            if name.endswith("PERPETUAL") or "_" in name:   # skip perp + combos
+                continue
+            exp = pd.to_datetime(ts, unit="ms", utc=True)
+            if exp.year > 2100:                              # perp sentinel
+                continue
+            rows.append({
+                "future_instrument_name": name,
+                "expiry_date": exp.normalize().date(),
+                "expiration_timestamp": ts,
+                "settlement_period": item.get("settlement_period"),
+            })
+        time.sleep(sleep_sec)
+
+    if not rows:
+        return pd.DataFrame()
+
+    df = pd.DataFrame(rows).drop_duplicates(subset="future_instrument_name")
+    df = df.sort_values("expiration_timestamp").reset_index(drop=True)
+    print(f"  Listed {currency} futures found: {len(df)} "
+          f"({df['expiry_date'].min()} to {df['expiry_date'].max()})")
+    return df
+
+
 def get_future_price(instrument_name, start_date, end_date, resolution="5",
-                     sleep_sec=0.3, use_history=True):
+                     sleep_sec=0.3, verbose=True):
+    """OHLCV for ONE dated future. Close renamed future_close.
+
+    Uses www.deribit.com: get_tradingview_chart_data serves expired
+    instruments there (the API docs' own example is BTC-5APR19, long dead).
+    history.deribit.com does NOT expose this method."""
     if resolution not in _RESOLUTION_MINUTES:
         raise ValueError(
             f"Invalid resolution '{resolution}'. "
             f"Choose from: {list(_RESOLUTION_MINUTES.keys())}"
         )
 
-    base = DERIBIT_HIST if use_history else DERIBIT_BASE
     candle_min = _RESOLUTION_MINUTES[resolution]
     batch_td = timedelta(minutes=candle_min * 5000)
 
     start_dt = datetime.strptime(start_date, "%Y-%m-%d")
     end_dt = datetime.strptime(end_date, "%Y-%m-%d") + timedelta(days=1)
 
-    url = f"{base}/public/get_tradingview_chart_data"
+    url = f"{DERIBIT_BASE}/public/get_tradingview_chart_data"
     all_frames = []
     current_start = start_dt
+    last_status = None
+    last_error = None
 
     while current_start < end_dt:
         current_end = min(current_start + batch_td, end_dt)
@@ -192,15 +250,21 @@ def get_future_price(instrument_name, start_date, end_date, resolution="5",
 
         try:
             r = requests.get(url, params=params, timeout=30)
-            r.raise_for_status()
             data = r.json()
         except Exception as e:
-            print(f"    Error fetching {instrument_name}: {e}")
+            last_error = str(e)
             time.sleep(2)
             current_start = current_end
             continue
 
+        if "error" in data:
+            last_error = data["error"].get("message", str(data["error"]))
+            current_start = current_end
+            time.sleep(sleep_sec)
+            continue
+
         result = data.get("result", {})
+        last_status = result.get("status", last_status)
         ticks = result.get("ticks", [])
 
         if ticks:
@@ -217,6 +281,9 @@ def get_future_price(instrument_name, start_date, end_date, resolution="5",
         time.sleep(sleep_sec)
 
     if not all_frames:
+        if verbose:
+            why = last_error or f"status={last_status}"
+            print(f"    {instrument_name}: no candles ({why})")
         return pd.DataFrame()
 
     df = pd.concat(all_frames, ignore_index=True)
@@ -231,28 +298,54 @@ def get_dated_futures_for_expiries(expiries, start_date, end_date, resolution="5
                                    sleep_sec=0.3, currency="BTC",
                                    save_csv=True,
                                    csv_path="deribit_btc_dated_futures.csv"):
-    expiries = sorted(pd.Timestamp(e) for e in pd.unique(pd.Series(list(expiries)).dropna()))
+    """Fetch the dated future matching each option expiry.
+
+    Names are resolved against Deribit's own instrument list, so an expiry
+    with no listed future is skipped up front instead of burning API calls
+    on a guessed ticker."""
+    expiries = sorted(pd.Timestamp(e) for e in
+                      pd.unique(pd.Series(list(expiries)).dropna()))
     print(f"\nFetching dated futures for {len(expiries)} unique option expiries ...")
 
+    listing = get_futures_instruments(currency=currency)
+    name_by_date = ({} if listing.empty else
+                    dict(zip(listing["expiry_date"], listing["future_instrument_name"])))
+
     frames = []
-    missing = []
+    unlisted = []
+    no_data = []
+
     for i, exp in enumerate(expiries, 1):
-        instr = future_instrument_name(exp, currency=currency)
-        fdf = get_future_price(instr, start_date, end_date, resolution=resolution,
-                               sleep_sec=sleep_sec)
+        exp_date = exp.date() if hasattr(exp, "date") else pd.Timestamp(exp).date()
+        instr = name_by_date.get(exp_date)
+
+        if instr is None:
+            if name_by_date:
+                unlisted.append(str(exp_date))
+                print(f"  [{i}/{len(expiries)}] {exp_date}: no listed future")
+                continue
+            instr = future_instrument_name(exp, currency=currency)  # listing failed
+
+        fdf = get_future_price(instr, start_date, end_date,
+                               resolution=resolution, sleep_sec=sleep_sec)
         if fdf.empty:
-            missing.append(instr)
-            print(f"  [{i}/{len(expiries)}] {instr}: no future data found")
+            no_data.append(instr)
             continue
+
         fdf["expiry_dt"] = exp
         fdf["future_instrument_name"] = instr
         frames.append(fdf)
         print(f"  [{i}/{len(expiries)}] {instr}: {len(fdf)} candles")
 
-    if missing:
-        print(f"  [!] {len(missing)} expiries with no matching dated future: {missing}")
+    if unlisted:
+        print(f"  [!] {len(unlisted)} expiries Deribit never listed a future for: "
+              f"{unlisted}")
+    if no_data:
+        print(f"  [!] {len(no_data)} futures listed but returned no candles in "
+              f"this window: {no_data}")
 
     if not frames:
+        print("  [!] No dated futures retrieved at all.")
         return pd.DataFrame()
 
     out = pd.concat(frames, ignore_index=True)
@@ -262,7 +355,6 @@ def get_dated_futures_for_expiries(expiries, start_date, end_date, resolution="5
         print(f"  Saved: {csv_path}")
 
     return out
-
 
 def attach_dated_future(panel, future_df, resolution="5"):
     panel = panel.copy()

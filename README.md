@@ -81,8 +81,9 @@ Two conventions are handled explicitly, and both matter for calibration.
 in USD. The panel carries both `price_btc` and `price_usd`, and the pricer in the
 calibration module prices the inverse payoff directly rather than converting.
 
-**Futures as the underlying.** Options settle against the future,
-so the panel carries the traded future itself. `get_dated_futures_for_expiries()`
+**Futures as the hedging instrument.** Deribit's BTC index is non-tradable. In order to hedge the option,
+the termed and perpetual futures will be used.
+So the panel carries the traded future itself. `get_dated_futures_for_expiries()`
 pulls the OHLCV of the dated future matching each option expiry, and
 `attach_dated_future()` merges it onto every row on `(timestamp, expiry_dt)` —
 so a `BTC-27JUN25-*` option only ever picks up `BTC-27JUN25`, never another
