@@ -152,244 +152,6 @@ def get_index_price(start_date, end_date, resolution="5", sleep_sec=0.3):
     return df
 
 
-_MONTH_ABBR = ["JAN", "FEB", "MAR", "APR", "MAY", "JUN",
-               "JUL", "AUG", "SEP", "OCT", "NOV", "DEC"]
-
-
-def future_instrument_name(expiry_dt, currency="BTC"):
-    # Deribit does NOT zero-pad the day: BTC-5APR19, not BTC-05APR19.
-    expiry_dt = pd.Timestamp(expiry_dt)
-    return (f"{currency}-{expiry_dt.day}"
-            f"{_MONTH_ABBR[expiry_dt.month - 1]}{expiry_dt.year % 100:02d}")
-
-
-def get_futures_instruments(currency="BTC", include_expired=True, sleep_sec=0.3):
-    """Real listed future names from Deribit, keyed by expiry date.
-
-    Beats building the name by hand: it gets the day-padding right, and it
-    only ever returns maturities Deribit actually listed. Active instruments
-    come from www; expired ones from history.deribit.com, which keeps the
-    full back catalogue."""
-    rows = []
-    jobs = [(DERIBIT_BASE, "false")]
-    if include_expired:
-        jobs.append((DERIBIT_HIST, "true"))
-
-    for base, expired in jobs:
-        url = f"{base}/public/get_instruments"
-        params = {"currency": currency, "kind": "future", "expired": expired}
-        try:
-            r = requests.get(url, params=params, timeout=30)
-            r.raise_for_status()
-            result = r.json().get("result", [])
-        except Exception as e:
-            print(f"  Error listing futures (expired={expired}): {e}")
-            result = []
-
-        for item in result:
-            name = item.get("instrument_name", "")
-            ts = item.get("expiration_timestamp")
-            if not name or ts is None:
-                continue
-            if name.endswith("PERPETUAL") or "_" in name:   # skip perp + combos
-                continue
-            exp = pd.to_datetime(ts, unit="ms", utc=True)
-            if exp.year > 2100:                              # perp sentinel
-                continue
-            rows.append({
-                "future_instrument_name": name,
-                "expiry_date": exp.normalize().date(),
-                "expiration_timestamp": ts,
-                "settlement_period": item.get("settlement_period"),
-            })
-        time.sleep(sleep_sec)
-
-    if not rows:
-        return pd.DataFrame()
-
-    df = pd.DataFrame(rows).drop_duplicates(subset="future_instrument_name")
-    df = df.sort_values("expiration_timestamp").reset_index(drop=True)
-    print(f"  Listed {currency} futures found: {len(df)} "
-          f"({df['expiry_date'].min()} to {df['expiry_date'].max()})")
-    return df
-
-
-def get_future_price(instrument_name, start_date, end_date, resolution="5",
-                     sleep_sec=0.3, verbose=True):
-    """OHLCV for ONE dated future. Close renamed future_close.
-
-    Uses www.deribit.com: get_tradingview_chart_data serves expired
-    instruments there (the API docs' own example is BTC-5APR19, long dead).
-    history.deribit.com does NOT expose this method."""
-    if resolution not in _RESOLUTION_MINUTES:
-        raise ValueError(
-            f"Invalid resolution '{resolution}'. "
-            f"Choose from: {list(_RESOLUTION_MINUTES.keys())}"
-        )
-
-    candle_min = _RESOLUTION_MINUTES[resolution]
-    batch_td = timedelta(minutes=candle_min * 5000)
-
-    start_dt = datetime.strptime(start_date, "%Y-%m-%d")
-    end_dt = datetime.strptime(end_date, "%Y-%m-%d") + timedelta(days=1)
-
-    url = f"{DERIBIT_BASE}/public/get_tradingview_chart_data"
-    all_frames = []
-    current_start = start_dt
-    last_status = None
-    last_error = None
-
-    while current_start < end_dt:
-        current_end = min(current_start + batch_td, end_dt)
-        params = {
-            "instrument_name": instrument_name,
-            "resolution": resolution,
-            "start_timestamp": int(current_start.timestamp() * 1000),
-            "end_timestamp": int(current_end.timestamp() * 1000),
-        }
-
-        try:
-            r = requests.get(url, params=params, timeout=30)
-            data = r.json()
-        except Exception as e:
-            last_error = str(e)
-            time.sleep(2)
-            current_start = current_end
-            continue
-
-        if "error" in data:
-            last_error = data["error"].get("message", str(data["error"]))
-            current_start = current_end
-            time.sleep(sleep_sec)
-            continue
-
-        result = data.get("result", {})
-        last_status = result.get("status", last_status)
-        ticks = result.get("ticks", [])
-
-        if ticks:
-            all_frames.append(pd.DataFrame({
-                "timestamp": ticks,
-                "future_open": result.get("open", []),
-                "future_high": result.get("high", []),
-                "future_low": result.get("low", []),
-                "future_close": result.get("close", []),
-                "future_volume": result.get("volume", []),
-            }))
-
-        current_start = current_end
-        time.sleep(sleep_sec)
-
-    if not all_frames:
-        if verbose:
-            why = last_error or f"status={last_status}"
-            print(f"    {instrument_name}: no candles ({why})")
-        return pd.DataFrame()
-
-    df = pd.concat(all_frames, ignore_index=True)
-    df["timestamp"] = pd.to_datetime(df["timestamp"], unit="ms", utc=True)
-    df.drop_duplicates(subset="timestamp", inplace=True)
-    df.sort_values("timestamp", inplace=True)
-    df.reset_index(drop=True, inplace=True)
-    return df
-
-
-def get_dated_futures_for_expiries(expiries, start_date, end_date, resolution="5",
-                                   sleep_sec=0.3, currency="BTC",
-                                   save_csv=True,
-                                   csv_path="deribit_btc_dated_futures.csv"):
-    """Fetch the dated future matching each option expiry.
-
-    Names are resolved against Deribit's own instrument list, so an expiry
-    with no listed future is skipped up front instead of burning API calls
-    on a guessed ticker."""
-    expiries = sorted(pd.Timestamp(e) for e in
-                      pd.unique(pd.Series(list(expiries)).dropna()))
-    print(f"\nFetching dated futures for {len(expiries)} unique option expiries ...")
-
-    listing = get_futures_instruments(currency=currency)
-    name_by_date = ({} if listing.empty else
-                    dict(zip(listing["expiry_date"], listing["future_instrument_name"])))
-
-    frames = []
-    unlisted = []
-    no_data = []
-
-    for i, exp in enumerate(expiries, 1):
-        exp_date = exp.date() if hasattr(exp, "date") else pd.Timestamp(exp).date()
-        instr = name_by_date.get(exp_date)
-
-        if instr is None:
-            if name_by_date:
-                unlisted.append(str(exp_date))
-                print(f"  [{i}/{len(expiries)}] {exp_date}: no listed future")
-                continue
-            instr = future_instrument_name(exp, currency=currency)  # listing failed
-
-        fdf = get_future_price(instr, start_date, end_date,
-                               resolution=resolution, sleep_sec=sleep_sec)
-        if fdf.empty:
-            no_data.append(instr)
-            continue
-
-        fdf["expiry_dt"] = exp
-        fdf["future_instrument_name"] = instr
-        frames.append(fdf)
-        print(f"  [{i}/{len(expiries)}] {instr}: {len(fdf)} candles")
-
-    if unlisted:
-        print(f"  [!] {len(unlisted)} expiries Deribit never listed a future for: "
-              f"{unlisted}")
-    if no_data:
-        print(f"  [!] {len(no_data)} futures listed but returned no candles in "
-              f"this window: {no_data}")
-
-    if not frames:
-        print("  [!] No dated futures retrieved at all.")
-        return pd.DataFrame()
-
-    out = pd.concat(frames, ignore_index=True)
-
-    if save_csv:
-        out.to_csv(csv_path, index=False)
-        print(f"  Saved: {csv_path}")
-
-    return out
-
-def attach_dated_future(panel, future_df, resolution="5"):
-    panel = panel.copy()
-
-    if future_df is None or future_df.empty:
-        for c in ["future_instrument_name", "future_open", "future_high",
-                  "future_low", "future_price", "future_volume", "future_basis"]:
-            panel[c] = np.nan
-        return panel
-
-    freq_str = f"{_RESOLUTION_MINUTES[resolution]}min" if resolution != "1D" else "1D"
-    fdf = future_df.copy()
-    fdf["timestamp"] = fdf["timestamp"].dt.floor(freq_str)
-    fdf = fdf.drop_duplicates(subset=["timestamp", "expiry_dt"], keep="last")
-    fdf.rename(columns={"future_close": "future_price"}, inplace=True)
-
-    keep_cols = ["timestamp", "expiry_dt", "future_instrument_name",
-                 "future_open", "future_high", "future_low", "future_price",
-                 "future_volume"]
-    fdf = fdf[[c for c in keep_cols if c in fdf.columns]]
-
-    merged = pd.merge(panel, fdf, on=["timestamp", "expiry_dt"], how="left")
-
-    merged["future_basis"] = (
-        (merged["future_price"] - merged["index_price"]) / merged["index_price"]
-    )
-
-    n_matched = merged["future_price"].notna().sum()
-    n_futures = merged["future_instrument_name"].nunique() if "future_instrument_name" in merged else 0
-    print(f"  Dated future price matched: {n_matched} of {len(merged)} rows "
-          f"({n_futures} distinct futures)")
-
-    return merged
-
-
 def parse_instrument(name):
     parts = str(name).split("-")
     if len(parts) != 4:
@@ -785,6 +547,197 @@ def attach_true_index(panel, true_index_df, resolution="60"):
     return out
 
 
+def estimate_forwards(panel, min_pairs=3):
+    calls = panel[panel["option_type"] == "C"][
+        ["timestamp", "expiry_dt", "strike", "price_usd", "tte_years"]]
+    puts = panel[panel["option_type"] == "P"][
+        ["timestamp", "expiry_dt", "strike", "price_usd"]]
+
+    pairs = pd.merge(calls, puts, on=["timestamp", "expiry_dt", "strike"],
+                     suffixes=("_c", "_p"))
+    if pairs.empty:
+        print("  No matched call/put pairs — cannot estimate forwards.")
+        return pd.DataFrame()
+
+    pairs["cp_diff"] = pairs["price_usd_c"] - pairs["price_usd_p"]
+
+    rows = []
+    for (ts, exp), g in pairs.groupby(["timestamp", "expiry_dt"]):
+        if len(g) < min_pairs or g["strike"].nunique() < 2:
+            continue
+        slope, intercept = np.polyfit(g["strike"].values, g["cp_diff"].values, 1)
+        df_factor = -slope
+        if df_factor <= 0:
+            continue
+        forward = intercept / df_factor
+        tte_y = float(g["tte_years"].iloc[0])
+        rate = -np.log(df_factor) / tte_y if tte_y > 0 and df_factor > 0 else np.nan
+        rows.append({
+            "timestamp": ts,
+            "expiry_dt": exp,
+            "forward": forward,
+            "discount_factor": df_factor,
+            "implied_rate": rate,
+            "n_pairs": len(g),
+        })
+
+    out = pd.DataFrame(rows)
+    print(f"  Forwards estimated for {len(out)} (timestamp, expiry) pairs.")
+    return out
+
+
+def _btc_price_from_forward(F, K, T, sigma, opt_type):
+    from math import log, sqrt, erf
+
+    def _norm_cdf(x):
+        return 0.5 * (1.0 + erf(x / sqrt(2.0)))
+
+    vs = sigma * sqrt(T)
+    d1 = (log(F / K) + 0.5 * sigma * sigma * T) / vs
+    d2 = d1 - vs
+
+    if opt_type == "C":
+        return _norm_cdf(d1) - (K / F) * _norm_cdf(d2)
+    return (K / F) * _norm_cdf(-d2) - _norm_cdf(-d1)
+
+
+def _solve_forward(price_btc, K, T, sigma, opt_type,
+                   lo_mult=0.01, hi_mult=100.0, tol=1e-10, max_iter=100):
+    if not np.isfinite([price_btc, K, T, sigma]).all():
+        return np.nan
+    if price_btc <= 0 or K <= 0 or T <= 0 or sigma <= 0:
+        return np.nan
+
+    lo, hi = K * lo_mult, K * hi_mult
+
+    try:
+        f_lo = _btc_price_from_forward(lo, K, T, sigma, opt_type) - price_btc
+        f_hi = _btc_price_from_forward(hi, K, T, sigma, opt_type) - price_btc
+    except (ValueError, ZeroDivisionError, OverflowError):
+        return np.nan
+
+    if not (np.isfinite(f_lo) and np.isfinite(f_hi)) or f_lo * f_hi > 0:
+        return np.nan   # price not attainable — bad quote or bad iv
+
+    for _ in range(max_iter):
+        mid = 0.5 * (lo + hi)
+        try:
+            f_mid = _btc_price_from_forward(mid, K, T, sigma, opt_type) - price_btc
+        except (ValueError, ZeroDivisionError, OverflowError):
+            return np.nan
+        if abs(f_mid) < tol or (hi - lo) / mid < tol:
+            return mid
+        if f_lo * f_mid <= 0:
+            hi = mid
+        else:
+            lo, f_lo = mid, f_mid
+
+    return 0.5 * (lo + hi)
+
+
+def estimate_forwards_from_iv(panel, price_col="price_btc", iv_col="iv",
+                              moneyness_band=None, min_quotes=1,
+                              aggregate="median", keep_per_quote=False):
+    df = panel.copy()
+
+    needed = {price_col, iv_col, "strike", "tte_years", "option_type",
+              "index_price", "timestamp", "expiry_dt"}
+    missing = needed - set(df.columns)
+    if missing:
+        raise ValueError(f"panel is missing columns: {sorted(missing)}")
+
+    if moneyness_band is not None:
+        lo, hi = moneyness_band
+        df = df[(df["moneyness"] >= lo) & (df["moneyness"] <= hi)]
+
+    df = df[(df[price_col] > 0) & (df[iv_col] > 0) & (df["tte_years"] > 0)]
+    df = df[df[[price_col, iv_col, "strike", "tte_years", "index_price"]]
+            .notna().all(axis=1)]
+
+    if df.empty:
+        print("  No usable quotes for IV inversion.")
+        return (pd.DataFrame(), pd.DataFrame()) if keep_per_quote else pd.DataFrame()
+
+    print(f"  Inverting {len(df)} quotes for the forward ...")
+
+    df["forward_quote"] = [
+        _solve_forward(p, k, t, s, o)
+        for p, k, t, s, o in zip(df[price_col], df["strike"], df["tte_years"],
+                                 df[iv_col], df["option_type"])
+    ]
+
+    n_failed = df["forward_quote"].isna().sum()
+    df = df[df["forward_quote"].notna()]
+    print(f"  Inverted: {len(df)} | failed: {n_failed}")
+
+    if df.empty:
+        return (pd.DataFrame(), pd.DataFrame()) if keep_per_quote else pd.DataFrame()
+
+    agg = df.groupby(["timestamp", "expiry_dt"]).agg(
+        forward=("forward_quote", aggregate),
+        forward_std=("forward_quote", "std"),
+        n_quotes=("forward_quote", "size"),
+        index_price=("index_price", "median"),
+        tte_years=("tte_years", "median"),
+    ).reset_index()
+
+    agg = agg[agg["n_quotes"] >= min_quotes]
+
+    agg["discount_factor"] = agg["index_price"] / agg["forward"]
+    agg["implied_rate"] = np.log(agg["forward"] / agg["index_price"]) / agg["tte_years"]
+    agg["forward_cv"] = agg["forward_std"] / agg["forward"]
+
+    print(f"  Forwards from IV: {len(agg)} (timestamp, expiry) pairs.")
+    if len(agg):
+        print(f"  Median dispersion across strikes: "
+              f"{agg['forward_cv'].median():.4%} "
+              f"(high values mean stale quotes in that bin)")
+
+    if keep_per_quote:
+        return agg, df[["timestamp", "expiry_dt", "instrument_name", "strike",
+                        "option_type", "forward_quote"]]
+    return agg
+
+
+def attach_forward_per_row(panel, price_col="price_btc", iv_col="iv",
+                           add_slice_stats=True):
+    out = panel.copy()
+
+    for c in (price_col, iv_col, "strike", "tte_years", "option_type"):
+        if c not in out.columns:
+            raise ValueError(f"panel is missing required column: {c}")
+
+    if price_col != "price_btc":
+        print(f"  [!] price_col='{price_col}'. Deribit's trade `iv` belongs to "
+              f"`price`, so anything else here is internally inconsistent.")
+
+    print(f"\nInverting forward per row from '{price_col}' ({len(out)} rows) ...")
+    out["forward"] = [
+        _solve_forward(p_, k, t, s_, o)
+        for p_, k, t, s_, o in zip(out[price_col], out["strike"],
+                                   out["tte_years"], out[iv_col],
+                                   out["option_type"])
+    ]
+
+    n_ok = out["forward"].notna().sum()
+    print(f"  Inverted: {n_ok} | failed (NaN): {len(out) - n_ok}")
+
+    out["discount_factor"] = out["index_price"] / out["forward"]
+    out["implied_rate"] = np.log(out["forward"] / out["index_price"]) / out["tte_years"]
+
+    if add_slice_stats:
+        grp = out.groupby(["timestamp", "expiry_dt"])["forward"]
+        out["forward_slice_med"] = grp.transform("median")
+        out["forward_slice_cv"] = grp.transform("std") / out["forward_slice_med"]
+        out["forward_dev"] = (out["forward"] - out["forward_slice_med"]) / out["forward_slice_med"]
+        cv = out["forward_slice_cv"].dropna()
+        if len(cv):
+            print(f"  Cross-strike dispersion within a slice: median {cv.median():.4%}")
+            print("  -> filter on forward_slice_cv / forward_dev to drop stale quotes")
+
+    return out
+
+
 def get_chain_snapshot(panel, timestamp):
     ts = pd.Timestamp(timestamp)
     if ts.tz is None:
@@ -838,10 +791,10 @@ def get_live_chain(currency="BTC", save_csv=True,
         if col in df.columns:
             df[col] = pd.to_numeric(df[col], errors="coerce")
 
-    df["underlying_price"] = pd.to_numeric(df.get("underlying_price", np.nan),
-                                           errors="coerce")
+    df["forward_price"] = pd.to_numeric(df.get("underlying_price", np.nan),
+                                        errors="coerce")
     df["underlying_index"] = df.get("underlying_index", np.nan)
-    df["index_price"] = df["underlying_price"]
+    df["index_price"] = df["forward_price"]   # see caveat above
     df["mark_price_btc"] = df.get("mark_price", np.nan)
     df["mark_price_usd"] = df["mark_price_btc"] * df["index_price"]
     df["iv"] = df.get("mark_iv", np.nan) / 100.0
@@ -856,7 +809,7 @@ def get_live_chain(currency="BTC", save_csv=True,
     df["log_moneyness"] = np.log(df["moneyness"])
 
     keep = ["timestamp", "instrument_name", "option_type", "strike", "expiry_dt",
-            "tte_days", "tte_years", "index_price", "underlying_price",
+            "tte_days", "tte_years", "index_price", "forward_price",
             "underlying_index", "moneyness", "log_moneyness",
             "bid_price", "ask_price", "mid_btc", "mid_usd", "spread_btc",
             "mark_price_btc", "mark_price_usd", "iv", "volume", "open_interest"]
@@ -885,8 +838,9 @@ def get_deribit_pricing_data(
         moneyness_range=None,
         min_price_btc=0.0001,
         option_chunk_hours=6,
+        compute_forwards=True,
+        forward_price_col="price_btc",    # the iv on a trade belongs to `price`
         use_perp_fallback=False,          # perp != index; off by default
-        fetch_dated_futures=True,         # attach the maturity-matched future
         save_intermediate=True,
     ):
     index_df = get_index_price(start_date, end_date, resolution)
@@ -928,12 +882,8 @@ def get_deribit_pricing_data(
     print("\nPerpetual basis diagnostic (index vs perp on shared bins):")
     index_basis_check(panel)
 
-    if fetch_dated_futures:
-        future_df = get_dated_futures_for_expiries(
-            panel["expiry_dt"].unique(), start_date, end_date,
-            resolution=resolution, save_csv=save_intermediate,
-        )
-        panel = attach_dated_future(panel, future_df, resolution=resolution)
+    if compute_forwards:
+        panel = attach_forward_per_row(panel, price_col=forward_price_col)
 
     return panel
 
@@ -942,8 +892,8 @@ def resume_from_saved(index_csv, option_csv, resolution="5",
                       expiry_type=None, option_type=None,
                       min_tte_days=0.0, max_tte_days=None,
                       moneyness_range=None, min_price_btc=0.0001,
-                      use_perp_fallback=False,
-                      fetch_dated_futures=True,
+                      compute_forwards=True, forward_method="iv",
+                      forward_price_col="price_btc",
                       start_date="2025-01-01", end_date="2025-12-31"):
     print("Resuming from saved CSVs ...")
 
@@ -974,13 +924,8 @@ def resume_from_saved(index_csv, option_csv, resolution="5",
     panel = attach_spot(panel, index_df, resolution,
                         use_perp_fallback=use_perp_fallback)
 
-    if fetch_dated_futures:
-        future_df = get_dated_futures_for_expiries(
-            panel["expiry_dt"].unique(), start_date, end_date,
-            resolution=resolution, save_csv=False,
-        )
-        panel = attach_dated_future(panel, future_df, resolution=resolution)
-
+    if compute_forwards:
+        panel = attach_forward_per_row(panel, price_col=forward_price_col)
     return panel
 
 
@@ -997,8 +942,9 @@ if __name__ == "__main__":
         moneyness_range=None,     # None = every strike
         min_price_btc=0.0001,     # drop one-tick dust quotes
         option_chunk_hours=6,
+        compute_forwards=True,
+        forward_price_col="price_btc",    # invert Deribit's own IV
         use_perp_fallback=False,   # keep the index honest; see index_source
-        fetch_dated_futures=True,  # attach the maturity-matched dated future
         save_intermediate=True,
     )
 

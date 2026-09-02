@@ -81,23 +81,20 @@ Two conventions are handled explicitly, and both matter for calibration.
 in USD. The panel carries both `price_btc` and `price_usd`, and the pricer in the
 calibration module prices the inverse payoff directly rather than converting.
 
-**Futures as the hedging instrument.** Deribit's BTC index is non-tradable. In order to hedge the option,
-the termed and perpetual futures will be used.
-So the panel carries the traded future itself. `get_dated_futures_for_expiries()`
-pulls the OHLCV of the dated future matching each option expiry, and
-`attach_dated_future()` merges it onto every row on `(timestamp, expiry_dt)` —
-so a `BTC-27JUN25-*` option only ever picks up `BTC-27JUN25`, never another
-maturity. That adds `future_instrument_name`, `future_open/high/low/price/volume`
-and `future_basis` to the panel. The perpetual is carried alongside as
-`perp_close`. Expiries with no listed dated future — Deribit lists futures for
-weekly, monthly and quarterly maturities, not for every daily option expiry — are
-reported and left as `NaN` rather than silently filled.
+**Forward, not spot.** Options settle against the forward. Two estimators are
+provided: `estimate_forwards()` by put–call parity, and
+`estimate_forwards_from_iv()`, which inverts Deribit's own implied volatility field
+to back out F(t, T). The second is the default, because parity needs a matched call
+and put at the same strike and timestamp, which trade data often does not supply.
+`attach_forward_per_row()` writes `forward`, `discount_factor` and `implied_rate`
+onto every row.
 
 `index_basis_check()` reports the perpetual-versus-index basis, so substituting the
 perp for the index is a visible choice rather than a silent one. That fallback is
 off by default.
 
 Main entry point:
+
 
 ```python
 from src.Deribit_option_retrieval import get_deribit_pricing_data
@@ -107,10 +104,9 @@ panel = get_deribit_pricing_data(
     end_date="2025-06-30",
     resolution="5",
     min_tte_days=1.0,
-    fetch_dated_futures=True,
+    compute_forwards=True,
 )
 ```
-
 `resume_from_saved()` rebuilds the panel from cached CSVs (the dated futures are
 re-fetched, since they are not in those CSVs).
 `get_chain_snapshot(panel, timestamp)` extracts a single cross-section for one
