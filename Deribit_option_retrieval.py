@@ -1,49 +1,3 @@
-"""
-Deribit_pricing_option_retrieval.py
-
-Retrieve Deribit BTC option data for PRICING and CALIBRATION.
-
-Difference from the ATM/strategy version
-----------------------------------------
-The strategy script picked ONE instrument per time bin (front expiry, nearest
-to ATM). This script keeps EVERY instrument. The output is a long panel:
-
-    one row per (time bin, instrument)
-
-so each timestamp holds a full cross-section of strikes and expiries, together
-with the spot (index) price at that time. That is the shape you need to fit a
-CGMY / VG / Heston surface.
-
-Two data streams
-----------------
-  1. SPOT / INDEX (OHLCV at chosen resolution):
-     - Endpoint: https://www.deribit.com/api/v2/public/get_tradingview_chart_data
-     - Instrument: BTC-PERPETUAL
-
-  2. OPTION TRADES (tick level, then binned):
-     - Endpoint: https://history.deribit.com/api/v2/public/get_last_trades_by_currency_and_time
-     - Currency: BTC, kind: option
-     - NO strike filter, NO expiry filter, calls AND puts.
-
-  3. Optional: LIVE full chain snapshot (mark price + mark IV for every listed
-     instrument, no trade needed).
-     - Endpoint: https://www.deribit.com/api/v2/public/get_book_summary_by_currency
-
-Output columns (main panel)
----------------------------
-  timestamp, index_price, perp_close, instrument_name, option_type, strike,
-  expiry_dt, tte_days, tte_years, moneyness, log_moneyness,
-  price_btc, price_usd, mark_price_btc, mark_price_usd, iv, n_trades_in_bin
-
-Notes on Deribit conventions
-----------------------------
-  - Option prices are quoted in BTC per 1 BTC of notional (inverse options).
-    price_usd = price_btc * index_price is the usual USD conversion.
-  - `iv` from the API is in percent (e.g. 55.2 means 0.552). Converted here.
-  - Options settle against the forward, not spot. Use estimate_forwards() to
-    back out F(t, T) by put-call parity before calibrating.
-"""
-
 import requests
 import pandas as pd
 import numpy as np
@@ -67,10 +21,6 @@ _VALID_EXPIRY_TYPES = {"daily", "weekly", "monthly", "quarterly"}
 
 DAYS_PER_YEAR = 365.0
 
-
-# ══════════════════════════════════════════════════════════════════════════════
-# EXPIRY UTILITIES (kept for OPTIONAL filtering — default is "keep everything")
-# ══════════════════════════════════════════════════════════════════════════════
 
 def last_friday_of_month(year, month):
     last_day = calendar.monthrange(year, month)[1]
@@ -128,12 +78,7 @@ def generate_expiry_dates(expiry_type, start_date, end_date):
     return sorted(expiries)
 
 
-# ══════════════════════════════════════════════════════════════════════════════
-# PART 1: SPOT / INDEX PRICE
-# ══════════════════════════════════════════════════════════════════════════════
-
 def get_index_price(start_date, end_date, resolution="5", sleep_sec=0.3):
-    """OHLCV for BTC-PERPETUAL at the chosen resolution. Close renamed perp_close."""
     if resolution not in _RESOLUTION_MINUTES:
         raise ValueError(
             f"Invalid resolution '{resolution}'. "
@@ -207,9 +152,151 @@ def get_index_price(start_date, end_date, resolution="5", sleep_sec=0.3):
     return df
 
 
-# ══════════════════════════════════════════════════════════════════════════════
-# PART 2: ALL OPTION TRADES (no strike / expiry / type filter)
-# ══════════════════════════════════════════════════════════════════════════════
+_MONTH_ABBR = ["JAN", "FEB", "MAR", "APR", "MAY", "JUN",
+               "JUL", "AUG", "SEP", "OCT", "NOV", "DEC"]
+
+
+def future_instrument_name(expiry_dt, currency="BTC"):
+    expiry_dt = pd.Timestamp(expiry_dt)
+    return (f"{currency}-{expiry_dt.day:02d}"
+            f"{_MONTH_ABBR[expiry_dt.month - 1]}{expiry_dt.year % 100:02d}")
+
+
+def get_future_price(instrument_name, start_date, end_date, resolution="5",
+                     sleep_sec=0.3, use_history=True):
+    if resolution not in _RESOLUTION_MINUTES:
+        raise ValueError(
+            f"Invalid resolution '{resolution}'. "
+            f"Choose from: {list(_RESOLUTION_MINUTES.keys())}"
+        )
+
+    base = DERIBIT_HIST if use_history else DERIBIT_BASE
+    candle_min = _RESOLUTION_MINUTES[resolution]
+    batch_td = timedelta(minutes=candle_min * 5000)
+
+    start_dt = datetime.strptime(start_date, "%Y-%m-%d")
+    end_dt = datetime.strptime(end_date, "%Y-%m-%d") + timedelta(days=1)
+
+    url = f"{base}/public/get_tradingview_chart_data"
+    all_frames = []
+    current_start = start_dt
+
+    while current_start < end_dt:
+        current_end = min(current_start + batch_td, end_dt)
+        params = {
+            "instrument_name": instrument_name,
+            "resolution": resolution,
+            "start_timestamp": int(current_start.timestamp() * 1000),
+            "end_timestamp": int(current_end.timestamp() * 1000),
+        }
+
+        try:
+            r = requests.get(url, params=params, timeout=30)
+            r.raise_for_status()
+            data = r.json()
+        except Exception as e:
+            print(f"    Error fetching {instrument_name}: {e}")
+            time.sleep(2)
+            current_start = current_end
+            continue
+
+        result = data.get("result", {})
+        ticks = result.get("ticks", [])
+
+        if ticks:
+            all_frames.append(pd.DataFrame({
+                "timestamp": ticks,
+                "future_open": result.get("open", []),
+                "future_high": result.get("high", []),
+                "future_low": result.get("low", []),
+                "future_close": result.get("close", []),
+                "future_volume": result.get("volume", []),
+            }))
+
+        current_start = current_end
+        time.sleep(sleep_sec)
+
+    if not all_frames:
+        return pd.DataFrame()
+
+    df = pd.concat(all_frames, ignore_index=True)
+    df["timestamp"] = pd.to_datetime(df["timestamp"], unit="ms", utc=True)
+    df.drop_duplicates(subset="timestamp", inplace=True)
+    df.sort_values("timestamp", inplace=True)
+    df.reset_index(drop=True, inplace=True)
+    return df
+
+
+def get_dated_futures_for_expiries(expiries, start_date, end_date, resolution="5",
+                                   sleep_sec=0.3, currency="BTC",
+                                   save_csv=True,
+                                   csv_path="deribit_btc_dated_futures.csv"):
+    expiries = sorted(pd.Timestamp(e) for e in pd.unique(pd.Series(list(expiries)).dropna()))
+    print(f"\nFetching dated futures for {len(expiries)} unique option expiries ...")
+
+    frames = []
+    missing = []
+    for i, exp in enumerate(expiries, 1):
+        instr = future_instrument_name(exp, currency=currency)
+        fdf = get_future_price(instr, start_date, end_date, resolution=resolution,
+                               sleep_sec=sleep_sec)
+        if fdf.empty:
+            missing.append(instr)
+            print(f"  [{i}/{len(expiries)}] {instr}: no future data found")
+            continue
+        fdf["expiry_dt"] = exp
+        fdf["future_instrument_name"] = instr
+        frames.append(fdf)
+        print(f"  [{i}/{len(expiries)}] {instr}: {len(fdf)} candles")
+
+    if missing:
+        print(f"  [!] {len(missing)} expiries with no matching dated future: {missing}")
+
+    if not frames:
+        return pd.DataFrame()
+
+    out = pd.concat(frames, ignore_index=True)
+
+    if save_csv:
+        out.to_csv(csv_path, index=False)
+        print(f"  Saved: {csv_path}")
+
+    return out
+
+
+def attach_dated_future(panel, future_df, resolution="5"):
+    panel = panel.copy()
+
+    if future_df is None or future_df.empty:
+        for c in ["future_instrument_name", "future_open", "future_high",
+                  "future_low", "future_price", "future_volume", "future_basis"]:
+            panel[c] = np.nan
+        return panel
+
+    freq_str = f"{_RESOLUTION_MINUTES[resolution]}min" if resolution != "1D" else "1D"
+    fdf = future_df.copy()
+    fdf["timestamp"] = fdf["timestamp"].dt.floor(freq_str)
+    fdf = fdf.drop_duplicates(subset=["timestamp", "expiry_dt"], keep="last")
+    fdf.rename(columns={"future_close": "future_price"}, inplace=True)
+
+    keep_cols = ["timestamp", "expiry_dt", "future_instrument_name",
+                 "future_open", "future_high", "future_low", "future_price",
+                 "future_volume"]
+    fdf = fdf[[c for c in keep_cols if c in fdf.columns]]
+
+    merged = pd.merge(panel, fdf, on=["timestamp", "expiry_dt"], how="left")
+
+    merged["future_basis"] = (
+        (merged["future_price"] - merged["index_price"]) / merged["index_price"]
+    )
+
+    n_matched = merged["future_price"].notna().sum()
+    n_futures = merged["future_instrument_name"].nunique() if "future_instrument_name" in merged else 0
+    print(f"  Dated future price matched: {n_matched} of {len(merged)} rows "
+          f"({n_futures} distinct futures)")
+
+    return merged
+
 
 def parse_instrument(name):
     parts = str(name).split("-")
@@ -279,7 +366,6 @@ def fetch_option_trades_chunk(start_ms, end_ms, count=10000, sleep_sec=0.15,
 def fetch_all_option_trades(start_date, end_date, chunk_hours=6,
                             sleep_sec=0.15, save_csv=True,
                             csv_path="deribit_btc_option_trades_raw.csv"):
-    """Every BTC option trade in the window. Calls and puts, all strikes, all expiries."""
     start_dt = datetime.strptime(start_date, "%Y-%m-%d")
     end_dt = datetime.strptime(end_date, "%Y-%m-%d") + timedelta(days=1)
     chunk_td = timedelta(hours=chunk_hours)
@@ -331,7 +417,6 @@ def fetch_all_option_trades(start_date, end_date, chunk_hours=6,
         df.get("mark_price", pd.Series(index=df.index, dtype=float)), errors="coerce")
     df["mark_price_usd"] = df["mark_price_btc"] * df["index_price"]
 
-    # Deribit reports iv in percent -> decimal
     iv_raw = pd.to_numeric(df.get("iv", pd.Series(index=df.index, dtype=float)),
                            errors="coerce")
     df["iv"] = iv_raw / 100.0
@@ -356,10 +441,6 @@ def fetch_all_option_trades(start_date, end_date, chunk_hours=6,
     return df
 
 
-# ══════════════════════════════════════════════════════════════════════════════
-# PART 3: BUILD THE FULL PANEL — one row per (time bin, instrument)
-# ══════════════════════════════════════════════════════════════════════════════
-
 def build_option_panel(option_df, resolution="5",
                        expiry_type=None,
                        option_type=None,
@@ -367,27 +448,6 @@ def build_option_panel(option_df, resolution="5",
                        moneyness_range=None,
                        min_price_btc=0.0,
                        start_date=None, end_date=None):
-    """
-    Keep every instrument. Within each time bin, take the LAST trade of each
-    instrument. Result is a long panel: (timestamp, instrument) rows.
-
-    Parameters
-    ----------
-    resolution : str
-        Bin size. Same codes as the index candles.
-    expiry_type : str or None
-        None (default) keeps ALL expiries. Set to 'weekly'/'monthly'/etc. to
-        restrict. Needs start_date and end_date when used.
-    option_type : 'C', 'P', or None
-        None (default) keeps both.
-    min_tte_days, max_tte_days : float or None
-        Maturity window. min_tte_days=0 drops already-expired rows.
-    moneyness_range : (lo, hi) or None
-        Keep strikes with lo <= K/S <= hi. None keeps every strike.
-    min_price_btc : float
-        Drop trades at or below this price. Deribit's tick is 0.0001 BTC, so
-        0.0001 removes the near-worthless wings that wreck a calibration.
-    """
     if resolution not in _RESOLUTION_MINUTES:
         raise ValueError(
             f"Invalid resolution '{resolution}'. "
@@ -473,32 +533,7 @@ def build_option_panel(option_df, resolution="5",
     return panel
 
 
-# ══════════════════════════════════════════════════════════════════════════════
-# PART 4: ATTACH SPOT, THEN OPTIONAL FORWARDS
-# ══════════════════════════════════════════════════════════════════════════════
-
 def attach_spot(panel, index_df, resolution="5", use_perp_fallback=False):
-    """
-    Attach the spot series and RECORD WHERE IT CAME FROM.
-
-    IMPORTANT
-    ---------
-    `index_price` on an option trade is Deribit's BTC index at that tick — the
-    real thing. `perp_close` is the BTC-PERPETUAL price, which is a traded
-    instrument sitting at a basis to the index. They are NOT the same series.
-
-    Earlier versions filled missing index_price with perp_close silently. That
-    is off by the perpetual basis, and the error propagates into moneyness,
-    price_usd and the implied rate R = ln(F/X)/T. Fallback is now OFF by
-    default, and every row is tagged in `index_source`:
-
-        'trade'       - Deribit index stamped on the option trade (accurate)
-        'perp_proxy'  - BTC-PERPETUAL close, only if use_perp_fallback=True
-        'missing'     - no spot available
-
-    For a true index series, use get_index_series_from_trades() (denser than
-    the options panel, but not guaranteed gap-free — see its docstring).
-    """
     print(f"\n[4/4] Attaching spot series ...")
 
     panel = panel.copy()
@@ -533,15 +568,6 @@ def attach_spot(panel, index_df, resolution="5", use_perp_fallback=False):
 
 
 def index_basis_check(panel):
-    """
-    Measure the perpetual basis using data you already have. Zero extra API
-    calls.
-
-    On bins where an option traded, you have BOTH the true index (from the
-    trade record) and perp_close. The gap between them is the perpetual basis
-    — i.e. exactly the error you would inject by using the perp as an index
-    proxy. Run this before deciding whether the proxy is good enough.
-    """
     if "perp_close" not in panel.columns:
         print("  No perp_close column — nothing to compare.")
         return pd.DataFrame()
@@ -576,24 +602,6 @@ def get_index_series_from_trades(start_date, end_date, resolution="60",
                                  sleep_sec=0.12, max_calls=20000,
                                  save_csv=True,
                                  csv_path="deribit_btc_index_true.csv"):
-    """
-    Reconstruct the TRUE index series from perpetual trade records.
-
-    VERIFIED (Deribit OpenAPI, public_trade schema): every trade record carries
-    `index_price` = "Index Price at the moment of trade", and it is a REQUIRED
-    field for all instrument kinds, not just options. So a perp trade gives you
-    the real index at that tick.
-
-    NOT VERIFIED: how often the perpetual actually trades. Deribit publishes no
-    figure for this. Bins with no perp trade produce NO row here — the series
-    is denser than the options panel, but it is NOT guaranteed gap-free. Check
-    the "bins with an index value" count in the output against the bin count,
-    and reindex/interpolate if you need a value in every bin.
-
-    COST: one HTTP call per bin. Cheap hourly (~8.8k calls per year), expensive
-    at 5-min (~105k calls per year). max_calls stops it running away — raise it
-    deliberately, or build the series at hourly resolution and interpolate.
-    """
     if resolution not in _RESOLUTION_MINUTES:
         raise ValueError(f"Invalid resolution '{resolution}'.")
 
@@ -665,11 +673,6 @@ def get_index_series_from_trades(start_date, end_date, resolution="60",
 
 
 def attach_true_index(panel, true_index_df, resolution="60"):
-    """
-    Overwrite index_price with the reconstructed true index from
-    get_index_series_from_trades(). Recomputes moneyness. Rows filled this way
-    are tagged index_source='index_reconstructed'.
-    """
     if true_index_df is None or true_index_df.empty:
         return panel
 
@@ -690,294 +693,7 @@ def attach_true_index(panel, true_index_df, resolution="60"):
     return out
 
 
-def estimate_forwards(panel, min_pairs=3):
-    """
-    FALLBACK METHOD. Prefer estimate_forwards_from_iv().
-
-    Back out the forward F(t,T) and discount factor by put-call parity.
-
-    For matched call/put pairs at the same (t, T, K), in USD:
-        C - P = DF * (F - K)
-    Regress (C - P) on K across strikes:
-        slope     = -DF
-        intercept =  DF * F   ->  F = intercept / DF
-
-    Returns a DataFrame: timestamp, expiry_dt, forward, discount_factor,
-    implied_rate, n_pairs. Rows with fewer than min_pairs matched strikes are
-    skipped. Use this before calibrating — Deribit options are forward-based,
-    not spot-based.
-    """
-    calls = panel[panel["option_type"] == "C"][
-        ["timestamp", "expiry_dt", "strike", "price_usd", "tte_years"]]
-    puts = panel[panel["option_type"] == "P"][
-        ["timestamp", "expiry_dt", "strike", "price_usd"]]
-
-    pairs = pd.merge(calls, puts, on=["timestamp", "expiry_dt", "strike"],
-                     suffixes=("_c", "_p"))
-    if pairs.empty:
-        print("  No matched call/put pairs — cannot estimate forwards.")
-        return pd.DataFrame()
-
-    pairs["cp_diff"] = pairs["price_usd_c"] - pairs["price_usd_p"]
-
-    rows = []
-    for (ts, exp), g in pairs.groupby(["timestamp", "expiry_dt"]):
-        if len(g) < min_pairs or g["strike"].nunique() < 2:
-            continue
-        slope, intercept = np.polyfit(g["strike"].values, g["cp_diff"].values, 1)
-        df_factor = -slope
-        if df_factor <= 0:
-            continue
-        forward = intercept / df_factor
-        tte_y = float(g["tte_years"].iloc[0])
-        rate = -np.log(df_factor) / tte_y if tte_y > 0 and df_factor > 0 else np.nan
-        rows.append({
-            "timestamp": ts,
-            "expiry_dt": exp,
-            "forward": forward,
-            "discount_factor": df_factor,
-            "implied_rate": rate,
-            "n_pairs": len(g),
-        })
-
-    out = pd.DataFrame(rows)
-    print(f"  Forwards estimated for {len(out)} (timestamp, expiry) pairs.")
-    return out
-
-
-def _btc_price_from_forward(F, K, T, sigma, opt_type):
-    """
-    Deribit's inverse-option price in BTC, as a function of the forward.
-
-    Substituting R = ln(F/X)/T into Deribit's formula makes the index cancel:
-        call_btc = N(d1) - (K/F) * N(d2)
-        put_btc  = (K/F) * N(-d2) - N(-d1)
-        d1 = (ln(F/K) + sigma^2 * T / 2) / (sigma * sqrt(T)),  d2 = d1 - sigma*sqrt(T)
-    """
-    from math import log, sqrt, erf
-
-    def _norm_cdf(x):
-        return 0.5 * (1.0 + erf(x / sqrt(2.0)))
-
-    vs = sigma * sqrt(T)
-    d1 = (log(F / K) + 0.5 * sigma * sigma * T) / vs
-    d2 = d1 - vs
-
-    if opt_type == "C":
-        return _norm_cdf(d1) - (K / F) * _norm_cdf(d2)
-    return (K / F) * _norm_cdf(-d2) - _norm_cdf(-d1)
-
-
-def _solve_forward(price_btc, K, T, sigma, opt_type,
-                   lo_mult=0.01, hi_mult=100.0, tol=1e-10, max_iter=100):
-    """Bisection for F. Monotone in F, so this is stable. Returns nan on failure."""
-    if not np.isfinite([price_btc, K, T, sigma]).all():
-        return np.nan
-    if price_btc <= 0 or K <= 0 or T <= 0 or sigma <= 0:
-        return np.nan
-
-    lo, hi = K * lo_mult, K * hi_mult
-
-    try:
-        f_lo = _btc_price_from_forward(lo, K, T, sigma, opt_type) - price_btc
-        f_hi = _btc_price_from_forward(hi, K, T, sigma, opt_type) - price_btc
-    except (ValueError, ZeroDivisionError, OverflowError):
-        return np.nan
-
-    if not (np.isfinite(f_lo) and np.isfinite(f_hi)) or f_lo * f_hi > 0:
-        return np.nan   # price not attainable — bad quote or bad iv
-
-    for _ in range(max_iter):
-        mid = 0.5 * (lo + hi)
-        try:
-            f_mid = _btc_price_from_forward(mid, K, T, sigma, opt_type) - price_btc
-        except (ValueError, ZeroDivisionError, OverflowError):
-            return np.nan
-        if abs(f_mid) < tol or (hi - lo) / mid < tol:
-            return mid
-        if f_lo * f_mid <= 0:
-            hi = mid
-        else:
-            lo, f_lo = mid, f_mid
-
-    return 0.5 * (lo + hi)
-
-
-def estimate_forwards_from_iv(panel, price_col="price_btc", iv_col="iv",
-                              moneyness_band=None, min_quotes=1,
-                              aggregate="median", keep_per_quote=False):
-    """
-    PRIMARY METHOD. Back out F(t,T) from Deribit's own IV, one instrument at a
-    time. No matched call/put pair needed, so it works on sparse bins.
-
-    For each quote we know price, K, T and sigma (Deribit's iv). Deribit's
-    pricing formula then has exactly one unknown left — the forward — so it
-    inverts directly. Every strike in a given (t, T) should return the same F,
-    which is a built-in consistency check: a wide spread across strikes means
-    stale quotes, not a real term structure.
-
-    Parameters
-    ----------
-    price_col : 'price_btc' (default, and the correct choice for trade data).
-        On a TRADE record, Deribit's `iv` is the implied vol OF THAT TRADED
-        PRICE, stamped at the same tick. price_btc and iv are therefore exactly
-        synchronous — no pairing, no staleness. Do NOT pass mark_price_btc
-        here: the trade's `iv` does not belong to the mark, so that combination
-        is internally inconsistent.
-        (Different rule for the LIVE chain: get_live_chain() returns mark_iv,
-        which DOES belong to mark_price. There, pair mark with mark_iv.)
-    moneyness_band : (lo, hi) or None
-        Restrict to strikes in this K/S range before inverting. Near-the-money
-        quotes invert far more reliably; deep wings have almost no vega, so a
-        one-tick price error moves the implied F a long way.
-    aggregate : 'median' or 'mean'
-        How to combine per-quote forwards within a (timestamp, expiry).
-
-    Returns
-    -------
-    DataFrame: timestamp, expiry_dt, forward, discount_factor, implied_rate,
-    n_quotes, forward_std. discount_factor is X/F and implied_rate is
-    ln(F/X)/T — Deribit's own R.
-    """
-    df = panel.copy()
-
-    needed = {price_col, iv_col, "strike", "tte_years", "option_type",
-              "index_price", "timestamp", "expiry_dt"}
-    missing = needed - set(df.columns)
-    if missing:
-        raise ValueError(f"panel is missing columns: {sorted(missing)}")
-
-    if moneyness_band is not None:
-        lo, hi = moneyness_band
-        df = df[(df["moneyness"] >= lo) & (df["moneyness"] <= hi)]
-
-    df = df[(df[price_col] > 0) & (df[iv_col] > 0) & (df["tte_years"] > 0)]
-    df = df[df[[price_col, iv_col, "strike", "tte_years", "index_price"]]
-            .notna().all(axis=1)]
-
-    if df.empty:
-        print("  No usable quotes for IV inversion.")
-        return (pd.DataFrame(), pd.DataFrame()) if keep_per_quote else pd.DataFrame()
-
-    print(f"  Inverting {len(df)} quotes for the forward ...")
-
-    df["forward_quote"] = [
-        _solve_forward(p, k, t, s, o)
-        for p, k, t, s, o in zip(df[price_col], df["strike"], df["tte_years"],
-                                 df[iv_col], df["option_type"])
-    ]
-
-    n_failed = df["forward_quote"].isna().sum()
-    df = df[df["forward_quote"].notna()]
-    print(f"  Inverted: {len(df)} | failed: {n_failed}")
-
-    if df.empty:
-        return (pd.DataFrame(), pd.DataFrame()) if keep_per_quote else pd.DataFrame()
-
-    agg = df.groupby(["timestamp", "expiry_dt"]).agg(
-        forward=("forward_quote", aggregate),
-        forward_std=("forward_quote", "std"),
-        n_quotes=("forward_quote", "size"),
-        index_price=("index_price", "median"),
-        tte_years=("tte_years", "median"),
-    ).reset_index()
-
-    agg = agg[agg["n_quotes"] >= min_quotes]
-
-    agg["discount_factor"] = agg["index_price"] / agg["forward"]
-    agg["implied_rate"] = np.log(agg["forward"] / agg["index_price"]) / agg["tte_years"]
-    agg["forward_cv"] = agg["forward_std"] / agg["forward"]
-
-    print(f"  Forwards from IV: {len(agg)} (timestamp, expiry) pairs.")
-    if len(agg):
-        print(f"  Median dispersion across strikes: "
-              f"{agg['forward_cv'].median():.4%} "
-              f"(high values mean stale quotes in that bin)")
-
-    if keep_per_quote:
-        return agg, df[["timestamp", "expiry_dt", "instrument_name", "strike",
-                        "option_type", "forward_quote"]]
-    return agg
-
-
-def attach_forward_per_row(panel, price_col="price_btc", iv_col="iv",
-                           add_slice_stats=True):
-    """
-    Attach the forward to EVERY PANEL ROW. No separate forwards DataFrame.
-
-    Each row already carries price, K, T, sigma (Deribit's iv) and the index,
-    so Deribit's pricing formula has exactly one unknown left — the forward.
-    We invert it per row.
-
-    Columns added
-    -------------
-      forward             F(t,T) inverted from `price_col`
-      discount_factor     X / F      (Deribit's convention; NOT exp(-r_usd*T))
-      implied_rate        ln(F/X)/T  (Deribit's R)
-      forward_slice_med   median forward across all quotes sharing (t, expiry)
-      forward_slice_cv    dispersion of those forwards -> staleness detector
-      forward_dev         (forward - forward_slice_med) / forward_slice_med
-
-    WHY price_btc AND NOT mark_price_btc
-    ------------------------------------
-    Deribit's schema defines the trade field `iv` as "Option implied volatility
-    for the price" — it is computed FROM `price`. So price_btc + iv is the
-    internally consistent pair: any bid-ask bounce in the traded price is also
-    in the iv, and the two cancel, recovering Deribit's forward exactly.
-
-    Inverting mark_price_btc against an iv derived from `price` does NOT
-    cancel. It injects the (mark - price) gap into F, signed by trade
-    direction. That path has been removed.
-
-    (mark_price_btc is still kept as a data column on the panel — it is a
-    perfectly good price series. It is only unusable as the input to THIS
-    inversion, because the iv on the same row does not belong to it.)
-
-    Rows that cannot be inverted (missing iv, non-positive price, expired) get
-    NaN, not a dropped row — panel length is preserved.
-    """
-    out = panel.copy()
-
-    for c in (price_col, iv_col, "strike", "tte_years", "option_type"):
-        if c not in out.columns:
-            raise ValueError(f"panel is missing required column: {c}")
-
-    if price_col != "price_btc":
-        print(f"  [!] price_col='{price_col}'. Deribit's trade `iv` belongs to "
-              f"`price`, so anything else here is internally inconsistent.")
-
-    print(f"\nInverting forward per row from '{price_col}' ({len(out)} rows) ...")
-    out["forward"] = [
-        _solve_forward(p_, k, t, s_, o)
-        for p_, k, t, s_, o in zip(out[price_col], out["strike"],
-                                   out["tte_years"], out[iv_col],
-                                   out["option_type"])
-    ]
-
-    n_ok = out["forward"].notna().sum()
-    print(f"  Inverted: {n_ok} | failed (NaN): {len(out) - n_ok}")
-
-    out["discount_factor"] = out["index_price"] / out["forward"]
-    out["implied_rate"] = np.log(out["forward"] / out["index_price"]) / out["tte_years"]
-
-    if add_slice_stats:
-        grp = out.groupby(["timestamp", "expiry_dt"])["forward"]
-        out["forward_slice_med"] = grp.transform("median")
-        out["forward_slice_cv"] = grp.transform("std") / out["forward_slice_med"]
-        out["forward_dev"] = (out["forward"] - out["forward_slice_med"]) / out["forward_slice_med"]
-        cv = out["forward_slice_cv"].dropna()
-        if len(cv):
-            print(f"  Cross-strike dispersion within a slice: median {cv.median():.4%}")
-            print("  -> filter on forward_slice_cv / forward_dev to drop stale quotes")
-
-    return out
-
-
 def get_chain_snapshot(panel, timestamp):
-    """
-    Pull one cross-section out of the panel: every strike and expiry at one time.
-    `timestamp` can be a string or Timestamp. Nearest available bin is used.
-    """
     ts = pd.Timestamp(timestamp)
     if ts.tz is None:
         ts = ts.tz_localize("UTC")
@@ -994,19 +710,8 @@ def get_chain_snapshot(panel, timestamp):
     return snap.reset_index(drop=True)
 
 
-# ══════════════════════════════════════════════════════════════════════════════
-# LIVE FULL CHAIN (no trades needed — mark prices for every listed instrument)
-# ══════════════════════════════════════════════════════════════════════════════
-
 def get_live_chain(currency="BTC", save_csv=True,
                    csv_path="deribit_live_chain.csv"):
-    """
-    Current full option chain: every listed strike and expiry, with bid, ask,
-    mark price and mark IV. This is a live snapshot only — no history.
-
-    Useful when the traded panel is too sparse. Traded data has holes; the book
-    summary does not.
-    """
     print(f"\nFetching live {currency} option chain ...")
     url = f"{DERIBIT_BASE}/public/get_book_summary_by_currency"
 
@@ -1041,14 +746,10 @@ def get_live_chain(currency="BTC", save_csv=True,
         if col in df.columns:
             df[col] = pd.to_numeric(df[col], errors="coerce")
 
-    # NOTE: for options, underlying_price is the FORWARD, not the index.
-    # underlying_index tells you which: a future's name (e.g. 'BTC-27JUN25')
-    # means a real future was used; the literal 'index_price' means no future
-    # exists for that expiry and Deribit fell back to the index.
-    df["forward_price"] = pd.to_numeric(df.get("underlying_price", np.nan),
-                                        errors="coerce")
+    df["underlying_price"] = pd.to_numeric(df.get("underlying_price", np.nan),
+                                           errors="coerce")
     df["underlying_index"] = df.get("underlying_index", np.nan)
-    df["index_price"] = df["forward_price"]   # see caveat above
+    df["index_price"] = df["underlying_price"]
     df["mark_price_btc"] = df.get("mark_price", np.nan)
     df["mark_price_usd"] = df["mark_price_btc"] * df["index_price"]
     df["iv"] = df.get("mark_iv", np.nan) / 100.0
@@ -1063,7 +764,7 @@ def get_live_chain(currency="BTC", save_csv=True,
     df["log_moneyness"] = np.log(df["moneyness"])
 
     keep = ["timestamp", "instrument_name", "option_type", "strike", "expiry_dt",
-            "tte_days", "tte_years", "index_price", "forward_price",
+            "tte_days", "tte_years", "index_price", "underlying_price",
             "underlying_index", "moneyness", "log_moneyness",
             "bid_price", "ask_price", "mid_btc", "mid_usd", "spread_btc",
             "mark_price_btc", "mark_price_usd", "iv", "volume", "open_interest"]
@@ -1081,10 +782,6 @@ def get_live_chain(currency="BTC", save_csv=True,
     return df
 
 
-# ══════════════════════════════════════════════════════════════════════════════
-# ORCHESTRATORS
-# ══════════════════════════════════════════════════════════════════════════════
-
 def get_deribit_pricing_data(
         start_date="2025-01-01",
         end_date="2025-12-31",
@@ -1096,17 +793,10 @@ def get_deribit_pricing_data(
         moneyness_range=None,
         min_price_btc=0.0001,
         option_chunk_hours=6,
-        compute_forwards=True,
-        forward_price_col="price_btc",    # the iv on a trade belongs to `price`
         use_perp_fallback=False,          # perp != index; off by default
+        fetch_dated_futures=True,         # attach the maturity-matched future
         save_intermediate=True,
     ):
-    """
-    Full pipeline. Returns ONE DataFrame.
-
-    One row per (time bin, instrument), all strikes, with forward,
-    discount_factor and implied_rate attached per row.
-    """
     index_df = get_index_price(start_date, end_date, resolution)
 
     if save_intermediate and not index_df.empty:
@@ -1146,8 +836,12 @@ def get_deribit_pricing_data(
     print("\nPerpetual basis diagnostic (index vs perp on shared bins):")
     index_basis_check(panel)
 
-    if compute_forwards:
-        panel = attach_forward_per_row(panel, price_col=forward_price_col)
+    if fetch_dated_futures:
+        future_df = get_dated_futures_for_expiries(
+            panel["expiry_dt"].unique(), start_date, end_date,
+            resolution=resolution, save_csv=save_intermediate,
+        )
+        panel = attach_dated_future(panel, future_df, resolution=resolution)
 
     return panel
 
@@ -1156,10 +850,9 @@ def resume_from_saved(index_csv, option_csv, resolution="5",
                       expiry_type=None, option_type=None,
                       min_tte_days=0.0, max_tte_days=None,
                       moneyness_range=None, min_price_btc=0.0001,
-                      compute_forwards=True, forward_method="iv",
-                      forward_price_col="price_btc",
+                      use_perp_fallback=False,
+                      fetch_dated_futures=True,
                       start_date="2025-01-01", end_date="2025-12-31"):
-    """Rebuild the panel from CSVs already on disk. No API calls. Returns one DataFrame."""
     print("Resuming from saved CSVs ...")
 
     index_df = pd.read_csv(index_csv)
@@ -1189,14 +882,15 @@ def resume_from_saved(index_csv, option_csv, resolution="5",
     panel = attach_spot(panel, index_df, resolution,
                         use_perp_fallback=use_perp_fallback)
 
-    if compute_forwards:
-        panel = attach_forward_per_row(panel, price_col=forward_price_col)
+    if fetch_dated_futures:
+        future_df = get_dated_futures_for_expiries(
+            panel["expiry_dt"].unique(), start_date, end_date,
+            resolution=resolution, save_csv=False,
+        )
+        panel = attach_dated_future(panel, future_df, resolution=resolution)
+
     return panel
 
-
-# ══════════════════════════════════════════════════════════════════════════════
-# MAIN
-# ══════════════════════════════════════════════════════════════════════════════
 
 if __name__ == "__main__":
 
@@ -1211,9 +905,8 @@ if __name__ == "__main__":
         moneyness_range=None,     # None = every strike
         min_price_btc=0.0001,     # drop one-tick dust quotes
         option_chunk_hours=6,
-        compute_forwards=True,
-        forward_price_col="price_btc",    # invert Deribit's own IV
         use_perp_fallback=False,   # keep the index honest; see index_source
+        fetch_dated_futures=True,  # attach the maturity-matched dated future
         save_intermediate=True,
     )
 
@@ -1221,11 +914,4 @@ if __name__ == "__main__":
         panel.to_csv("deribit_btc_pricing_panel_2025.csv", index=False)
         print("\nPanel saved: deribit_btc_pricing_panel_2025.csv")
 
-    # forward, discount_factor and implied_rate are now COLUMNS on the panel.
 
-    # One cross-section, e.g. for a single calibration run:
-    # snap = get_chain_snapshot(panel, "2025-06-27 08:00")
-    # snap.to_csv("chain_20250627.csv", index=False)
-
-    # Live full chain (all listed strikes, no trade needed):
-    # live = get_live_chain("BTC")
